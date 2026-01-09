@@ -390,6 +390,40 @@ func (d *Decoder) reconstructMacroblock(mbx, mby int) {
 	}
 }
 
+// reconstructInterMacroblock applies inter prediction and adds residuals.
+func (d *Decoder) reconstructInterMacroblock(mbx, mby int) {
+	// Perform motion-compensated prediction.
+	d.performInterPrediction(mbx, mby)
+
+	// Add residuals (inverse DCT).
+	// For inter prediction, we always use 16x16 mode for luma.
+	for j := 0; j < 4; j++ {
+		for i := 0; i < 4; i++ {
+			n := 4*j + i
+			y := 4*j + 1
+			x := 4*i + 8
+			mask := uint32(1) << uint(n)
+			if d.nzACMask&mask != 0 {
+				d.inverseDCT4(y, x, 16*n)
+			} else if d.nzDCMask&mask != 0 {
+				d.inverseDCT4DCOnly(y, x, 16*n)
+			}
+		}
+	}
+
+	// Chroma residuals.
+	if d.nzACMask&0x0f0000 != 0 {
+		d.inverseDCT8(ybrBY, ybrBX, bCoeffBase)
+	} else if d.nzDCMask&0x0f0000 != 0 {
+		d.inverseDCT8DCOnly(ybrBY, ybrBX, bCoeffBase)
+	}
+	if d.nzACMask&0xf00000 != 0 {
+		d.inverseDCT8(ybrRY, ybrRX, rCoeffBase)
+	} else if d.nzDCMask&0xf00000 != 0 {
+		d.inverseDCT8DCOnly(ybrRY, ybrRX, rCoeffBase)
+	}
+}
+
 // reconstruct reconstructs one macroblock and returns whether inner loop
 // filtering should be skipped for it.
 func (d *Decoder) reconstruct(mbx, mby int) (skip bool) {
@@ -408,29 +442,96 @@ func (d *Decoder) reconstruct(mbx, mby int) (skip bool) {
 		d.coeff[i] = 0
 	}
 	d.prepareYBR(mbx, mby)
-	// Parse the predictor modes.
-	d.usePredY16 = d.fp.readBit(145)
-	if d.usePredY16 {
-		d.parsePredModeY16(mbx)
-	} else {
-		d.parsePredModeY4(mbx)
-	}
-	d.parsePredModeC8()
-	// Parse the residuals.
-	if !skip {
-		skip = d.parseResiduals(mbx, mby)
-	} else {
+
+	// Determine if this is a keyframe or inter frame.
+	if d.frameHeader.KeyFrame {
+		// Keyframe: intra prediction only.
+		d.usePredY16 = d.fp.readBit(145)
 		if d.usePredY16 {
-			d.leftMB.nzY16 = 0
-			d.upMB[mbx].nzY16 = 0
+			d.parsePredModeY16(mbx)
+		} else {
+			d.parsePredModeY4(mbx)
 		}
-		d.leftMB.nzMask = 0
-		d.upMB[mbx].nzMask = 0
-		d.nzDCMask = 0
-		d.nzACMask = 0
+		d.parsePredModeC8()
+		// Parse the residuals.
+		if !skip {
+			skip = d.parseResiduals(mbx, mby)
+		} else {
+			if d.usePredY16 {
+				d.leftMB.nzY16 = 0
+				d.upMB[mbx].nzY16 = 0
+			}
+			d.leftMB.nzMask = 0
+			d.upMB[mbx].nzMask = 0
+			d.nzDCMask = 0
+			d.nzACMask = 0
+		}
+		// Reconstruct the YCbCr data and copy it to the image.
+		d.reconstructMacroblock(mbx, mby)
+	} else {
+		// Inter frame: may use intra or inter prediction.
+		isInter := d.parseMBModeInter(mbx, mby)
+
+		if isInter {
+			// Inter prediction.
+			d.usePredY16 = true // Inter mode uses 16x16 for residuals.
+
+			// Parse residuals.
+			if !skip {
+				skip = d.parseResiduals(mbx, mby)
+			} else {
+				d.leftMB.nzY16 = 0
+				d.upMB[mbx].nzY16 = 0
+				d.leftMB.nzMask = 0
+				d.upMB[mbx].nzMask = 0
+				d.nzDCMask = 0
+				d.nzACMask = 0
+			}
+
+			// Reconstruct using inter prediction.
+			d.reconstructInterMacroblock(mbx, mby)
+
+			// Update neighbor info for MV prediction.
+			d.leftMV = d.mbMV
+			d.leftRefFrame = d.refFrame
+			d.upMV[mbx] = d.mbMV
+			d.upRefFrame[mbx] = d.refFrame
+		} else {
+			// Intra prediction within inter frame.
+			d.usePredY16 = d.fp.readBit(yModeProb[0])
+			if d.usePredY16 {
+				d.parsePredModeY16Intra(mbx)
+			} else {
+				d.parsePredModeY4(mbx)
+			}
+			d.parsePredModeC8Intra()
+
+			// Parse residuals.
+			if !skip {
+				skip = d.parseResiduals(mbx, mby)
+			} else {
+				if d.usePredY16 {
+					d.leftMB.nzY16 = 0
+					d.upMB[mbx].nzY16 = 0
+				}
+				d.leftMB.nzMask = 0
+				d.upMB[mbx].nzMask = 0
+				d.nzDCMask = 0
+				d.nzACMask = 0
+			}
+
+			// Reconstruct using intra prediction.
+			d.reconstructMacroblock(mbx, mby)
+
+			// Update neighbor info (intra has zero MV).
+			d.leftMV = mvZero
+			d.leftRefFrame = refFrameIntra
+			d.upMV[mbx] = mvZero
+			d.upRefFrame[mbx] = refFrameIntra
+		}
 	}
-	// Reconstruct the YCbCr data and copy it to the image.
-	d.reconstructMacroblock(mbx, mby)
+
+	// Copy reconstructed data to the image.
 	for i, y := (mby*d.img.YStride+mbx)*16, 0; y < 16; i, y = i+d.img.YStride, y+1 {
 		copy(d.img.Y[i:i+16], d.ybr[ybrYY+y][ybrYX:ybrYX+16])
 	}

@@ -5,7 +5,262 @@
 package vp8
 
 // This file implements parsing the predictor modes, as specified in chapter
-// 11.
+// 11 (intra prediction) and chapter 16 (inter prediction).
+
+// Inter prediction modes (RFC 6386 Section 16.1).
+const (
+	mvModeNearest = iota // Use nearest motion vector.
+	mvModeNear           // Use near motion vector.
+	mvModeZero           // Use zero motion vector.
+	mvModeNew            // Read a new motion vector.
+	mvModeSplit          // Split mode (4x4 sub-block MVs).
+)
+
+// Reference frame types.
+const (
+	refFrameIntra  = 0 // Intra prediction (no reference frame).
+	refFrameLast   = 1 // Last decoded frame.
+	refFrameGolden = 2 // Golden reference frame.
+	refFrameAltRef = 3 // Alternate reference frame.
+)
+
+// Inter prediction probability tables (RFC 6386 Section 16.1).
+// yModeProb is used to decode the macroblock-level Y mode for inter frames.
+var yModeProb = [4]uint8{112, 86, 140, 37}
+
+// uvModeProb is used to decode the chroma mode for inter frames.
+var uvModeProb = [3]uint8{162, 101, 204}
+
+// mbSegmentTreeProbs is the probability for segment tree.
+var mbSegmentTreeProbs = [3]uint8{255, 255, 255}
+
+// Inter-frame macroblock mode probabilities.
+// mvRefProb[i] is the probability that the reference frame is not INTRA.
+var mvRefProb = [4]uint8{
+	0,   // Not used (index 0 is for when we have no context).
+	120, // Default probability for P-frame with no left/above context.
+	120,
+	120,
+}
+
+// subMvRefProb is the probability table for sub-block MV modes in SPLITMV.
+var subMvRefProb = [5][3]uint8{
+	{147, 136, 18},
+	{106, 145, 1},
+	{179, 121, 1},
+	{223, 1, 34},
+	{208, 1, 1},
+}
+
+// mvModeProb is the probability table for motion vector modes.
+// Indexed by [nearest_mv == 0][near_mv == 0].
+var mvModeProb = [2][2][4]uint8{
+	// nearest_mv != 0
+	{
+		// near_mv != 0
+		{7, 1, 1, 143},
+		// near_mv == 0
+		{14, 18, 14, 107},
+	},
+	// nearest_mv == 0
+	{
+		// near_mv != 0
+		{135, 145, 67, 106},
+		// near_mv == 0
+		{8, 75, 40, 155},
+	},
+}
+
+// parseMBModeInter parses the macroblock mode for inter frames.
+// Returns true if this is an inter-predicted macroblock, false for intra.
+// RFC 6386 Section 16.1.
+func (d *Decoder) parseMBModeInter(mbx, mby int) bool {
+	// First, determine if this macroblock uses intra or inter prediction.
+	// The probability depends on the neighboring macroblocks.
+	ctx := d.getInterModeContext(mbx, mby)
+	prob := d.getRefFrameProb(ctx)
+
+	if !d.fp.readBit(prob) {
+		// Intra macroblock.
+		d.isInterMB = false
+		d.refFrame = refFrameIntra
+		return false
+	}
+
+	// Inter macroblock - determine the reference frame.
+	d.isInterMB = true
+	d.refFrame = d.parseRefFrame()
+
+	// Parse the motion vector mode.
+	d.parseMVMode(mbx, mby)
+
+	return true
+}
+
+// getInterModeContext returns the context for inter mode prediction.
+func (d *Decoder) getInterModeContext(mbx, mby int) int {
+	ctx := 0
+	if mbx > 0 && d.leftRefFrame != refFrameIntra {
+		ctx++
+	}
+	if mby > 0 && d.aboveRefFrame != refFrameIntra {
+		ctx++
+	}
+	return ctx
+}
+
+// getRefFrameProb returns the probability for reference frame selection.
+func (d *Decoder) getRefFrameProb(ctx int) uint8 {
+	// Default probabilities based on context.
+	switch ctx {
+	case 0:
+		return 145 // No inter neighbors.
+	case 1:
+		return 165 // One inter neighbor.
+	default:
+		return 190 // Both neighbors are inter.
+	}
+}
+
+// parseRefFrame parses the reference frame for an inter macroblock.
+func (d *Decoder) parseRefFrame() uint8 {
+	// For simplicity, we assume LAST frame for now.
+	// Full implementation would parse the reference frame from the bitstream.
+	// RFC 6386 Section 16.1 describes the tree structure.
+	if !d.fp.readBit(128) {
+		return refFrameLast
+	}
+	if !d.fp.readBit(128) {
+		return refFrameGolden
+	}
+	return refFrameAltRef
+}
+
+// parseMVMode parses the motion vector mode for an inter macroblock.
+func (d *Decoder) parseMVMode(mbx, mby int) {
+	// Find the nearest and near motion vectors.
+	nearest, near := d.findBestMV(mbx, mby)
+
+	// Determine probabilities based on MV candidates.
+	nearestZero := nearest.x == 0 && nearest.y == 0
+	nearZero := near.x == 0 && near.y == 0
+	prob := mvModeProb[btou(nearestZero)][btou(nearZero)]
+
+	// Parse the MV mode using the probability tree.
+	if !d.fp.readBit(prob[0]) {
+		// NEARESTMV
+		d.mvMode = mvModeNearest
+		d.mbMV = d.clampMV(nearest, mbx, mby)
+	} else if !d.fp.readBit(prob[1]) {
+		// NEARMV
+		d.mvMode = mvModeNear
+		d.mbMV = d.clampMV(near, mbx, mby)
+	} else if !d.fp.readBit(prob[2]) {
+		// ZEROMV
+		d.mvMode = mvModeZero
+		d.mbMV = mvZero
+	} else if !d.fp.readBit(prob[3]) {
+		// NEWMV
+		d.mvMode = mvModeNew
+		// Read the new MV and add to the nearest MV.
+		deltaMV := d.readMV()
+		d.mbMV = d.clampMV(addMV(nearest, deltaMV), mbx, mby)
+	} else {
+		// SPLITMV - not implemented in Phase A.
+		// For now, fall back to ZEROMV.
+		d.mvMode = mvModeSplit
+		d.mbMV = mvZero
+		// TODO: Implement SPLITMV in Phase B.
+	}
+}
+
+// findBestMV finds the nearest and near motion vectors from neighboring macroblocks.
+// RFC 6386 Section 16.2.
+func (d *Decoder) findBestMV(mbx, mby int) (nearest, near motionVector) {
+	// Collect MV candidates from neighbors.
+	var candidates [3]motionVector
+	var candidateRefs [3]uint8
+	nCandidates := 0
+
+	// Left neighbor.
+	if mbx > 0 && d.leftRefFrame != refFrameIntra {
+		candidates[nCandidates] = d.leftMV
+		candidateRefs[nCandidates] = d.leftRefFrame
+		nCandidates++
+	}
+
+	// Above neighbor.
+	if mby > 0 && d.aboveRefFrame != refFrameIntra {
+		candidates[nCandidates] = d.aboveMV
+		candidateRefs[nCandidates] = d.aboveRefFrame
+		nCandidates++
+	}
+
+	// Above-left neighbor (simplified - using above).
+	if mbx > 0 && mby > 0 && d.upRefFrame[mbx-1] != refFrameIntra {
+		candidates[nCandidates] = d.upMV[mbx-1]
+		candidateRefs[nCandidates] = d.upRefFrame[mbx-1]
+		nCandidates++
+	}
+
+	// Apply sign bias correction and find best candidates.
+	refBias := d.signBias[d.refFrame]
+	for i := 0; i < nCandidates; i++ {
+		if d.signBias[candidateRefs[i]] != refBias {
+			// Invert the MV if sign bias differs.
+			candidates[i].x = -candidates[i].x
+			candidates[i].y = -candidates[i].y
+		}
+	}
+
+	// Select nearest (first non-zero) and near (second non-zero).
+	for i := 0; i < nCandidates; i++ {
+		if candidates[i].x != 0 || candidates[i].y != 0 {
+			if nearest.x == 0 && nearest.y == 0 {
+				nearest = candidates[i]
+			} else if (candidates[i].x != nearest.x || candidates[i].y != nearest.y) &&
+				(near.x == 0 && near.y == 0) {
+				near = candidates[i]
+				break
+			}
+		}
+	}
+
+	return nearest, near
+}
+
+// parsePredModeY16Intra parses intra Y16 mode for non-keyframes.
+func (d *Decoder) parsePredModeY16Intra(mbx int) {
+	// For intra blocks in inter frames, use different probabilities.
+	var p uint8
+	if !d.fp.readBit(yModeProb[0]) {
+		p = predDC
+	} else if !d.fp.readBit(yModeProb[1]) {
+		p = predVE
+	} else if !d.fp.readBit(yModeProb[2]) {
+		p = predHE
+	} else {
+		p = predTM
+	}
+	for i := 0; i < 4; i++ {
+		d.upMB[mbx].pred[i] = p
+		d.leftMB.pred[i] = p
+	}
+	d.predY16 = p
+}
+
+// parsePredModeC8Intra parses intra C8 mode for non-keyframes.
+func (d *Decoder) parsePredModeC8Intra() {
+	if !d.fp.readBit(uvModeProb[0]) {
+		d.predC8 = predDC
+	} else if !d.fp.readBit(uvModeProb[1]) {
+		d.predC8 = predVE
+	} else if !d.fp.readBit(uvModeProb[2]) {
+		d.predC8 = predHE
+	} else {
+		d.predC8 = predTM
+	}
+}
 
 func (d *Decoder) parsePredModeY16(mbx int) {
 	var p uint8
