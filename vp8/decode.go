@@ -120,6 +120,10 @@ type Decoder struct {
 	tokenProb   [nPlane][nBand][nContext][nProb]uint8
 	useSkipProb bool
 	skipProb    uint8
+	// Inter frame mode probabilities (RFC 6386 Section 9.10).
+	probIntra uint8
+	probLast  uint8
+	probGF    uint8
 	// Loop filter parameters.
 	filterParams      [nSegment][2]filterParam
 	perMBFilterParams []filterParam
@@ -404,13 +408,21 @@ func (d *Decoder) parseOtherHeaders() error {
 	// Read refreshLastFrameBuffer bit, specified in section 9.8.
 	d.refreshLast = d.fp.readBit(uniformProb)
 	d.parseTokenProb()
-	// For non-keyframes, parse MV probability updates (RFC 6386 Section 17.2).
-	if !d.frameHeader.KeyFrame {
-		d.parseMVProb()
-	}
+	// Read mb_no_coeff_skip flag (RFC 6386 Section 9.10).
 	d.useSkipProb = d.fp.readBit(uniformProb)
 	if d.useSkipProb {
 		d.skipProb = uint8(d.fp.readUint(uniformProb, 8))
+	}
+	// For inter frames, parse the intra/inter mode probabilities (RFC 6386 Section 9.10).
+	// This comes after mb_no_coeff_skip per the spec.
+	if !d.frameHeader.KeyFrame {
+		d.probIntra = uint8(d.fp.readUint(uniformProb, 8))
+		d.probLast = uint8(d.fp.readUint(uniformProb, 8))
+		d.probGF = uint8(d.fp.readUint(uniformProb, 8))
+	}
+	// For non-keyframes, parse MV probability updates (RFC 6386 Section 17.2).
+	if !d.frameHeader.KeyFrame {
+		d.parseMVProb()
 	}
 	// Note: We do not check fp.unexpectedEOF here because VP8's arithmetic
 	// coder is designed to return 0 when reading beyond the buffer end.
@@ -438,10 +450,10 @@ func (d *Decoder) copyFrame(src *image.YCbCr) *image.YCbCr {
 func (d *Decoder) updateFrameBuffers() {
 	if d.frameHeader.KeyFrame {
 		// For key frames, all reference buffers are updated with the current frame.
-		frame := d.copyFrame(d.img)
-		d.lastFrame = frame
-		d.goldenFrame = frame
-		d.altRefFrame = frame
+		// Each frame buffer needs to be a separate copy.
+		d.lastFrame = d.copyFrame(d.img)
+		d.goldenFrame = d.copyFrame(d.img)
+		d.altRefFrame = d.copyFrame(d.img)
 	} else {
 		// For inter frames, update buffers according to refresh flags.
 		// First, handle copy-to-buffer operations (before refresh).

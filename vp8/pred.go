@@ -76,18 +76,18 @@ var mvModeProb = [2][2][4]uint8{
 // RFC 6386 Section 16.1.
 func (d *Decoder) parseMBModeInter(mbx, mby int) bool {
 	// First, determine if this macroblock uses intra or inter prediction.
-	// The probability depends on the neighboring macroblocks.
-	ctx := d.getInterModeContext(mbx, mby)
-	prob := d.getRefFrameProb(ctx)
-
-	if !d.fp.readBit(prob) {
-		// Intra macroblock.
+	// Use prob_intra from the frame header (RFC 6386 Section 9.10, 16.1).
+	// prob_intra is the probability that the decoded bit is 1 (meaning INTRA).
+	// If bit is 0 (readBit returns false with high probability when prob is low),
+	// it means INTER prediction.
+	if d.fp.readBit(d.probIntra) {
+		// Bit is 1: Intra macroblock.
 		d.isInterMB = false
 		d.refFrame = refFrameIntra
 		return false
 	}
 
-	// Inter macroblock - determine the reference frame.
+	// Bit is 0: Inter macroblock - determine the reference frame.
 	d.isInterMB = true
 	d.refFrame = d.parseRefFrame()
 
@@ -123,14 +123,19 @@ func (d *Decoder) getRefFrameProb(ctx int) uint8 {
 }
 
 // parseRefFrame parses the reference frame for an inter macroblock.
+// RFC 6386 Section 16.1 describes the tree structure.
+// prob_last is P(bit=1), where bit=0 means LAST, bit=1 means GOLDEN or ALTREF.
+// prob_gf is P(bit=1), where bit=0 means GOLDEN, bit=1 means ALTREF.
 func (d *Decoder) parseRefFrame() uint8 {
-	// For simplicity, we assume LAST frame for now.
-	// Full implementation would parse the reference frame from the bitstream.
-	// RFC 6386 Section 16.1 describes the tree structure.
-	if !d.fp.readBit(128) {
+	// Use prob_last from frame header.
+	// If bit is 0 (readBit returns false), use LAST frame.
+	if !d.fp.readBit(d.probLast) {
 		return refFrameLast
 	}
-	if !d.fp.readBit(128) {
+	// Bit is 1, so choose between GOLDEN and ALTREF.
+	// Use prob_gf from frame header.
+	// If bit is 0 (readBit returns false), use GOLDEN frame.
+	if !d.fp.readBit(d.probGF) {
 		return refFrameGolden
 	}
 	return refFrameAltRef
@@ -141,24 +146,26 @@ func (d *Decoder) parseMVMode(mbx, mby int) {
 	// Find the nearest and near motion vectors.
 	nearest, near := d.findBestMV(mbx, mby)
 
+
 	// Determine probabilities based on MV candidates.
 	nearestZero := nearest.x == 0 && nearest.y == 0
 	nearZero := near.x == 0 && near.y == 0
 	prob := mvModeProb[btou(nearestZero)][btou(nearZero)]
 
 	// Parse the MV mode using the probability tree.
+	// Tree structure from libvpx: ZEROMV, NEARESTMV, NEARMV, NEWMV, SPLITMV
 	if !d.fp.readBit(prob[0]) {
-		// NEARESTMV
-		d.mvMode = mvModeNearest
-		d.mbMV = d.clampMV(nearest, mbx, mby)
-	} else if !d.fp.readBit(prob[1]) {
-		// NEARMV
-		d.mvMode = mvModeNear
-		d.mbMV = d.clampMV(near, mbx, mby)
-	} else if !d.fp.readBit(prob[2]) {
 		// ZEROMV
 		d.mvMode = mvModeZero
 		d.mbMV = mvZero
+	} else if !d.fp.readBit(prob[1]) {
+		// NEARESTMV
+		d.mvMode = mvModeNearest
+		d.mbMV = d.clampMV(nearest, mbx, mby)
+	} else if !d.fp.readBit(prob[2]) {
+		// NEARMV
+		d.mvMode = mvModeNear
+		d.mbMV = d.clampMV(near, mbx, mby)
 	} else if !d.fp.readBit(prob[3]) {
 		// NEWMV
 		d.mvMode = mvModeNew
@@ -196,7 +203,7 @@ func (d *Decoder) findBestMV(mbx, mby int) (nearest, near motionVector) {
 		nCandidates++
 	}
 
-	// Above-left neighbor (simplified - using above).
+	// Above-left neighbor.
 	if mbx > 0 && mby > 0 && d.upRefFrame[mbx-1] != refFrameIntra {
 		candidates[nCandidates] = d.upMV[mbx-1]
 		candidateRefs[nCandidates] = d.upRefFrame[mbx-1]
@@ -213,7 +220,7 @@ func (d *Decoder) findBestMV(mbx, mby int) (nearest, near motionVector) {
 		}
 	}
 
-	// Select nearest (first non-zero) and near (second non-zero).
+	// Select nearest (first non-zero) and near (second different non-zero).
 	for i := 0; i < nCandidates; i++ {
 		if candidates[i].x != 0 || candidates[i].y != 0 {
 			if nearest.x == 0 && nearest.y == 0 {
@@ -221,7 +228,6 @@ func (d *Decoder) findBestMV(mbx, mby int) (nearest, near motionVector) {
 			} else if (candidates[i].x != nearest.x || candidates[i].y != nearest.y) &&
 				(near.x == 0 && near.y == 0) {
 				near = candidates[i]
-				break
 			}
 		}
 	}

@@ -55,37 +55,40 @@ func (d *Decoder) parseMVProb() {
 }
 
 // readMVComponent reads a single motion vector component.
-// RFC 6386 Section 17.1.
+// RFC 6386 Section 17.1, following libvpx reference implementation.
 func (d *Decoder) readMVComponent(comp int) int16 {
 	p := &d.mvProb[comp]
 
 	// Is it a long or short MV?
 	if d.fp.readBit(p[mvpIsShort]) {
-		// Long MV: read 3 high bits and 7 low bits.
-		var mag int16
+		// Long MV: following libvpx vp8/decoder/decodemv.c read_mv_component()
+		var x int16
 
-		// Read bits 3-9 (high bits).
+		// Loop 1: Read bits 0, 1, 2
 		for i := 0; i < 3; i++ {
 			if d.fp.readBit(p[mvpBits+i]) {
-				mag |= 1 << uint(9-i)
+				x |= 1 << uint(i)
 			}
 		}
 
-		// Read bits 0-6 (low bits), starting from bit 6.
+		// Loop 2: Read bits 9 down to 4 (skip bit 3)
 		for i := 9; i > 3; i-- {
-			if d.fp.readBit(p[mvpBits+i-3]) {
-				mag |= 1 << uint(i-3)
+			if d.fp.readBit(p[mvpBits+i]) {
+				x |= 1 << uint(i)
 			}
 		}
 
-		// Add 8 (minimum value for long MV).
-		mag += 8
+		// Bit 3: conditional add 8
+		// If no high bits set (x & 0xFFF0 == 0), or if bit 3 is set, add 8.
+		if (x&0x03F0) == 0 || d.fp.readBit(p[mvpBits+3]) {
+			x += 8
+		}
 
 		// Read sign bit.
 		if d.fp.readBit(p[mvpSign]) {
-			return -mag
+			return -x
 		}
-		return mag
+		return x
 	}
 
 	// Short MV: tree decode values 0-7.

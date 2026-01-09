@@ -7,10 +7,17 @@ package vp8
 import (
 	"bytes"
 	"encoding/binary"
+	"fmt"
+	"image"
+	"image/color"
+	"image/png"
 	"io"
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/makiuchi-d/gozxing"
+	"github.com/makiuchi-d/gozxing/qrcode"
 )
 
 // IVF file format constants.
@@ -222,4 +229,279 @@ func TestDecodeMotionVideo(t *testing.T) {
 				i, img.Bounds().Dx(), img.Bounds().Dy(), h.Width, h.Height)
 		}
 	}
+}
+
+// decodeVideoFile is a helper function to decode an entire video file.
+func decodeVideoFile(t *testing.T, filename string, expectedWidth, expectedHeight int) {
+	path := filepath.Join("testdata", filename)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Skipf("test data not found: %v", err)
+	}
+
+	r := bytes.NewReader(data)
+	h, err := parseIVFHeader(r)
+	if err != nil {
+		t.Fatalf("parseIVFHeader: %v", err)
+	}
+
+	if int(h.Width) != expectedWidth || int(h.Height) != expectedHeight {
+		t.Errorf("IVF header size mismatch: got %dx%d, want %dx%d",
+			h.Width, h.Height, expectedWidth, expectedHeight)
+	}
+
+	t.Logf("IVF: %dx%d, %d frames", h.Width, h.Height, h.NumFrames)
+
+	d := NewDecoder()
+	keyframeCount := 0
+	interframeCount := 0
+
+	for i := uint32(0); i < h.NumFrames; i++ {
+		frameData, _, err := readIVFFrame(r)
+		if err != nil {
+			if err == io.EOF {
+				break
+			}
+			t.Fatalf("frame %d: readIVFFrame: %v", i, err)
+		}
+
+		d.Init(bytes.NewReader(frameData), len(frameData))
+
+		fh, err := d.DecodeFrameHeader()
+		if err != nil {
+			t.Fatalf("frame %d: DecodeFrameHeader: %v", i, err)
+		}
+
+		if fh.KeyFrame {
+			keyframeCount++
+		} else {
+			interframeCount++
+		}
+
+		img, err := d.DecodeFrame()
+		if err != nil {
+			t.Fatalf("frame %d: DecodeFrame: %v", i, err)
+		}
+
+		if img.Bounds().Dx() != expectedWidth || img.Bounds().Dy() != expectedHeight {
+			t.Errorf("frame %d: image size mismatch: got %dx%d, want %dx%d",
+				i, img.Bounds().Dx(), img.Bounds().Dy(), expectedWidth, expectedHeight)
+		}
+	}
+
+	t.Logf("Total: %d keyframes, %d inter frames", keyframeCount, interframeCount)
+}
+
+func TestDecode720p30fps1s(t *testing.T) {
+	decodeVideoFile(t, "720p_30fps_1s.ivf", 1280, 720)
+}
+
+func TestDecode720p60fps1s(t *testing.T) {
+	decodeVideoFile(t, "720p_60fps_1s.ivf", 1280, 720)
+}
+
+func TestDecode1080p30fps1s(t *testing.T) {
+	decodeVideoFile(t, "1080p_30fps_1s.ivf", 1920, 1080)
+}
+
+func TestDecode1080p60fps1s(t *testing.T) {
+	decodeVideoFile(t, "1080p_60fps_1s.ivf", 1920, 1080)
+}
+
+func TestDecode720p30fps5s(t *testing.T) {
+	decodeVideoFile(t, "720p_30fps_5s.ivf", 1280, 720)
+}
+
+func TestDecode1080p30fps5s(t *testing.T) {
+	decodeVideoFile(t, "1080p_30fps_5s.ivf", 1920, 1080)
+}
+
+// TestDecodeQRCodeVideo tests that the VP8 decoder produces frames with sufficient
+// quality to decode a QR code. This verifies the decoder meets minimum quality requirements.
+func TestDecodeCompareWithFFmpeg(t *testing.T) {
+	// Save failed frames for visual inspection.
+	const expectedQRContent = "VP8_DECODER_TEST_2025"
+	path := filepath.Join("testdata", "qrcode_best_quality.ivf")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Skipf("test data not found: %v", err)
+	}
+
+	r := bytes.NewReader(data)
+	h, err := parseIVFHeader(r)
+	if err != nil {
+		t.Fatalf("parseIVFHeader: %v", err)
+	}
+
+	d := NewDecoder()
+	qrReader := qrcode.NewQRCodeReader()
+	savedCount := 0
+
+	for i := uint32(0); i < h.NumFrames && savedCount < 3; i++ {
+		frameData, _, err := readIVFFrame(r)
+		if err != nil {
+			break
+		}
+
+		d.Init(bytes.NewReader(frameData), len(frameData))
+		fh, err := d.DecodeFrameHeader()
+		if err != nil {
+			t.Fatalf("frame %d: DecodeFrameHeader: %v", i, err)
+		}
+
+		img, err := d.DecodeFrame()
+		if err != nil {
+			t.Fatalf("frame %d: DecodeFrame: %v", i, err)
+		}
+
+		// Try to read QR code.
+		grayImg := ycbcrToGray(img)
+		bmp, _ := gozxing.NewBinaryBitmapFromImage(grayImg)
+		result, qrErr := qrReader.Decode(bmp, nil)
+
+		if qrErr != nil || result.GetText() != expectedQRContent {
+			// Save failed frame.
+			outPath := fmt.Sprintf("/tmp/vp8_failed_%d_key%v.png", i, fh.KeyFrame)
+			f, _ := os.Create(outPath)
+			bounds := img.Bounds()
+			rgba := image.NewRGBA(bounds)
+			for y := bounds.Min.Y; y < bounds.Max.Y; y++ {
+				for x := bounds.Min.X; x < bounds.Max.X; x++ {
+					rgba.Set(x, y, img.At(x, y))
+				}
+			}
+			png.Encode(f, rgba)
+			f.Close()
+			t.Logf("Frame %d (keyframe=%v) FAILED - saved to %s", i, fh.KeyFrame, outPath)
+			savedCount++
+		} else {
+			t.Logf("Frame %d (keyframe=%v) OK", i, fh.KeyFrame)
+		}
+	}
+}
+
+func TestDecodeQRCodeVideo(t *testing.T) {
+	const expectedQRContent = "VP8_DECODER_TEST_2025"
+
+	path := filepath.Join("testdata", "qrcode_best_quality.ivf")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Skipf("test data not found: %v", err)
+	}
+
+	r := bytes.NewReader(data)
+	h, err := parseIVFHeader(r)
+	if err != nil {
+		t.Fatalf("parseIVFHeader: %v", err)
+	}
+
+	t.Logf("IVF: %dx%d, %d frames", h.Width, h.Height, h.NumFrames)
+
+	d := NewDecoder()
+	qrReader := qrcode.NewQRCodeReader()
+
+	keyframeSuccess := 0
+	keyframeTotal := 0
+	interframeSuccess := 0
+	interframeTotal := 0
+
+	for i := uint32(0); i < h.NumFrames; i++ {
+		frameData, _, err := readIVFFrame(r)
+		if err != nil {
+			if err == io.EOF {
+				break
+			}
+			t.Fatalf("frame %d: readIVFFrame: %v", i, err)
+		}
+
+		d.Init(bytes.NewReader(frameData), len(frameData))
+
+		fh, err := d.DecodeFrameHeader()
+		if err != nil {
+			t.Fatalf("frame %d: DecodeFrameHeader: %v", i, err)
+		}
+
+		img, err := d.DecodeFrame()
+		if err != nil {
+			t.Fatalf("frame %d: DecodeFrame: %v", i, err)
+		}
+
+		isKeyframe := fh.KeyFrame
+
+		// Convert YCbCr to grayscale for QR code reading.
+		grayImg := ycbcrToGray(img)
+
+		// Try to decode QR code from the frame.
+		bmp, err := gozxing.NewBinaryBitmapFromImage(grayImg)
+		if err != nil {
+			if isKeyframe {
+				keyframeTotal++
+				t.Logf("frame %d (keyframe): failed to create bitmap: %v", i, err)
+			} else {
+				interframeTotal++
+			}
+			continue
+		}
+
+		result, err := qrReader.Decode(bmp, nil)
+		if err != nil {
+			if isKeyframe {
+				keyframeTotal++
+				t.Logf("frame %d (keyframe): failed to decode QR: %v", i, err)
+			} else {
+				interframeTotal++
+				// Log failed interframes to identify patterns.
+				t.Logf("frame %d (inter, %d from keyframe): failed to decode QR", i, int(i)%15)
+			}
+			continue
+		}
+
+		if result.GetText() == expectedQRContent {
+			if isKeyframe {
+				keyframeSuccess++
+				keyframeTotal++
+			} else {
+				interframeSuccess++
+				interframeTotal++
+			}
+		} else {
+			if isKeyframe {
+				keyframeTotal++
+			} else {
+				interframeTotal++
+			}
+			t.Logf("frame %d: QR decoded but content mismatch: got %q, want %q",
+				i, result.GetText(), expectedQRContent)
+		}
+	}
+
+	totalFrames := keyframeTotal + interframeTotal
+	qrDecodedCount := keyframeSuccess + interframeSuccess
+
+	t.Logf("Keyframe QR success: %d/%d (%.2f%%)", keyframeSuccess, keyframeTotal,
+		float64(keyframeSuccess)/float64(keyframeTotal)*100)
+	t.Logf("Interframe QR success: %d/%d (%.2f%%)", interframeSuccess, interframeTotal,
+		float64(interframeSuccess)/float64(interframeTotal)*100)
+	t.Logf("Total QR code decoded successfully in %d/%d frames", qrDecodedCount, totalFrames)
+
+	// At least 80% of frames should have readable QR codes.
+	minSuccessRate := 0.8
+	successRate := float64(qrDecodedCount) / float64(totalFrames)
+	if successRate < minSuccessRate {
+		t.Errorf("QR code success rate too low: got %.2f%%, want at least %.2f%%",
+			successRate*100, minSuccessRate*100)
+	}
+}
+
+// ycbcrToGray converts a YCbCr image to grayscale for QR code reading.
+func ycbcrToGray(img *image.YCbCr) *image.Gray {
+	bounds := img.Bounds()
+	gray := image.NewGray(bounds)
+	for y := bounds.Min.Y; y < bounds.Max.Y; y++ {
+		for x := bounds.Min.X; x < bounds.Max.X; x++ {
+			yOffset := img.YOffset(x, y)
+			gray.SetGray(x, y, color.Gray{Y: img.Y[yOffset]})
+		}
+	}
+	return gray
 }

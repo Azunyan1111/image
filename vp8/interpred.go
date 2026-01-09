@@ -217,16 +217,21 @@ func (d *Decoder) interPredictChromaPlane(baseX, baseY, fracX, fracY int, plane 
 
 // copyBlockFromRef copies a block from the reference frame without interpolation.
 func (d *Decoder) copyBlockFromRef(mbx, mby int, ref *image.YCbCr) {
+	d.copyBlockFromRefWithOffset(mbx, mby, ref, 0, 0)
+}
+
+// copyBlockFromRefWithOffset copies a block from the reference frame with an offset.
+func (d *Decoder) copyBlockFromRefWithOffset(mbx, mby int, ref *image.YCbCr, offsetX, offsetY int) {
 	// Copy luma (16x16).
 	for row := 0; row < 16; row++ {
-		srcY := mby*16 + row
+		srcY := mby*16 + row + offsetY
 		if srcY < 0 {
 			srcY = 0
 		} else if srcY >= ref.Rect.Max.Y {
 			srcY = ref.Rect.Max.Y - 1
 		}
 		for col := 0; col < 16; col++ {
-			srcX := mbx*16 + col
+			srcX := mbx*16 + col + offsetX
 			if srcX < 0 {
 				srcX = 0
 			} else if srcX >= ref.Rect.Max.X {
@@ -237,15 +242,17 @@ func (d *Decoder) copyBlockFromRef(mbx, mby int, ref *image.YCbCr) {
 	}
 
 	// Copy chroma (8x8 each).
+	chromaOffsetX := offsetX / 2
+	chromaOffsetY := offsetY / 2
 	for row := 0; row < 8; row++ {
-		srcY := mby*8 + row
+		srcY := mby*8 + row + chromaOffsetY
 		if srcY < 0 {
 			srcY = 0
 		} else if srcY >= ref.Rect.Max.Y/2 {
 			srcY = ref.Rect.Max.Y/2 - 1
 		}
 		for col := 0; col < 8; col++ {
-			srcX := mbx*8 + col
+			srcX := mbx*8 + col + chromaOffsetX
 			if srcX < 0 {
 				srcX = 0
 			} else if srcX >= ref.Rect.Max.X/2 {
@@ -261,16 +268,30 @@ func (d *Decoder) copyBlockFromRef(mbx, mby int, ref *image.YCbCr) {
 func (d *Decoder) performInterPrediction(mbx, mby int) {
 	ref := d.getRefFrame(d.refFrame)
 	if ref == nil {
-		// No reference frame available, use zero prediction.
+		// No reference frame available, fill with default gray.
+		for row := 0; row < 16; row++ {
+			for col := 0; col < 16; col++ {
+				d.ybr[1+row][8+col] = 128
+			}
+		}
+		for row := 0; row < 8; row++ {
+			for col := 0; col < 8; col++ {
+				d.ybr[17+row][8+col] = 128
+				d.ybr[17+row][24+col] = 128
+			}
+		}
 		return
 	}
 
 	mv := d.mbMV
 
-	// Check if MV is integer (no subpixel interpolation needed).
-	if mv.x&3 == 0 && mv.y&3 == 0 && mv.x == 0 && mv.y == 0 {
+	// For zero MV, always copy from reference.
+	if mv.x == 0 && mv.y == 0 {
 		// Zero MV - simple copy.
 		d.copyBlockFromRef(mbx, mby, ref)
+	} else if mv.x&3 == 0 && mv.y&3 == 0 {
+		// Integer MV (but non-zero) - simple copy with offset.
+		d.copyBlockFromRefWithOffset(mbx, mby, ref, int(mv.x>>2), int(mv.y>>2))
 	} else {
 		// Subpixel interpolation required.
 		d.interPredictLuma(mbx, mby, ref, mv)

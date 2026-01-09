@@ -498,7 +498,9 @@ func (d *Decoder) reconstruct(mbx, mby int) (skip bool) {
 			d.upRefFrame[mbx] = d.refFrame
 		} else {
 			// Intra prediction within inter frame.
-			d.usePredY16 = d.fp.readBit(yModeProb[0])
+			// RFC 6386 Section 16.1: read is_i4x4 with probability 145.
+			// bit 0 means Y16 mode, bit 1 means Y4 mode.
+			d.usePredY16 = !d.fp.readBit(145)
 			if d.usePredY16 {
 				d.parsePredModeY16Intra(mbx)
 			} else {
