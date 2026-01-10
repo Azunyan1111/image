@@ -44,12 +44,56 @@ var mvRefProb = [4]uint8{
 }
 
 // subMvRefProb is the probability table for sub-block MV modes in SPLITMV.
+// Indexed by context (based on left/above MVs being zero or same).
 var subMvRefProb = [5][3]uint8{
-	{147, 136, 18},
-	{106, 145, 1},
-	{179, 121, 1},
-	{223, 1, 34},
-	{208, 1, 1},
+	{147, 136, 18}, // Context 0: Normal
+	{106, 145, 1},  // Context 1: Left zero
+	{179, 121, 1},  // Context 2: Above zero
+	{223, 1, 34},   // Context 3: Both zero
+	{208, 1, 1},    // Context 4: Same
+}
+
+// SPLITMV partition types.
+const (
+	splitMV16x8 = 0 // 2 horizontal 16x8 partitions
+	splitMV8x16 = 1 // 2 vertical 8x16 partitions
+	splitMV8x8  = 2 // 4 8x8 partitions
+	splitMV4x4  = 3 // 16 4x4 partitions
+)
+
+// mbSplitProb is the probability table for SPLITMV partition type.
+var mbSplitProb = [3]uint8{110, 111, 150}
+
+// Sub-MV modes within SPLITMV.
+const (
+	subMVLeft   = 0 // Use left sub-block's MV
+	subMVAbove  = 1 // Use above sub-block's MV
+	subMVZero   = 2 // Zero MV
+	subMVNew    = 3 // Read new MV
+)
+
+// mbSplitCount is the number of partitions for each split type.
+var mbSplitCount = [4]int{2, 2, 4, 16}
+
+// mbSplitFillCount is how many 4x4 blocks each partition covers.
+var mbSplitFillCount = [4][16]int{
+	{8, 8},             // 16x8: 2 partitions of 8 blocks each
+	{8, 8},             // 8x16: 2 partitions of 8 blocks each
+	{4, 4, 4, 4},       // 8x8: 4 partitions of 4 blocks each
+	{1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1}, // 4x4: 16 partitions
+}
+
+// mbSplitFillOffset defines which 4x4 blocks belong to each partition.
+// Block indices in raster order: 0-3 top row, 4-7 second row, etc.
+var mbSplitFillOffset = [4][16][16]int{
+	// 16x8: top 8 blocks, bottom 8 blocks
+	{{0, 1, 2, 3, 4, 5, 6, 7}, {8, 9, 10, 11, 12, 13, 14, 15}},
+	// 8x16: left 8 blocks, right 8 blocks
+	{{0, 1, 4, 5, 8, 9, 12, 13}, {2, 3, 6, 7, 10, 11, 14, 15}},
+	// 8x8: four 8x8 quadrants
+	{{0, 1, 4, 5}, {2, 3, 6, 7}, {8, 9, 12, 13}, {10, 11, 14, 15}},
+	// 4x4: each block individually
+	{{0}, {1}, {2}, {3}, {4}, {5}, {6}, {7}, {8}, {9}, {10}, {11}, {12}, {13}, {14}, {15}},
 }
 
 // mvModeProb is the probability table for motion vector modes.
@@ -84,11 +128,13 @@ func (d *Decoder) parseMBModeInter(mbx, mby int) bool {
 		// Bit is 1: Intra macroblock.
 		d.isInterMB = false
 		d.refFrame = refFrameIntra
+		d.IntraMBCount++
 		return false
 	}
 
 	// Bit is 0: Inter macroblock - determine the reference frame.
 	d.isInterMB = true
+	d.InterMBCount++
 	d.refFrame = d.parseRefFrame()
 
 	// Parse the motion vector mode.
@@ -158,27 +204,156 @@ func (d *Decoder) parseMVMode(mbx, mby int) {
 		// ZEROMV
 		d.mvMode = mvModeZero
 		d.mbMV = mvZero
+		d.MVModeCount[mvModeZero]++
 	} else if !d.fp.readBit(prob[1]) {
 		// NEARESTMV
 		d.mvMode = mvModeNearest
 		d.mbMV = d.clampMV(nearest, mbx, mby)
+		d.MVModeCount[mvModeNearest]++
 	} else if !d.fp.readBit(prob[2]) {
 		// NEARMV
 		d.mvMode = mvModeNear
 		d.mbMV = d.clampMV(near, mbx, mby)
+		d.MVModeCount[mvModeNear]++
 	} else if !d.fp.readBit(prob[3]) {
 		// NEWMV
 		d.mvMode = mvModeNew
 		// Read the new MV and add to the nearest MV.
 		deltaMV := d.readMV()
 		d.mbMV = d.clampMV(addMV(nearest, deltaMV), mbx, mby)
+		d.MVModeCount[mvModeNew]++
 	} else {
-		// SPLITMV - not implemented in Phase A.
-		// For now, fall back to ZEROMV.
+		// SPLITMV - each sub-block has its own MV.
 		d.mvMode = mvModeSplit
-		d.mbMV = mvZero
-		// TODO: Implement SPLITMV in Phase B.
+		d.MVModeCount[mvModeSplit]++
+		d.parseSplitMV(mbx, mby, nearest)
 	}
+}
+
+// parseSplitMV parses the SPLITMV mode where sub-blocks have individual MVs.
+func (d *Decoder) parseSplitMV(mbx, mby int, nearest motionVector) {
+	// Parse the partition type using tree: {-3, 2, -2, 4, -0, -1}
+	// Tree structure: bit=0 → 4x4, bit=1,0 → 8x8, bit=1,1,0 → 16x8, bit=1,1,1 → 8x16
+	var splitType int
+	if !d.fp.readBit(mbSplitProb[0]) {
+		splitType = splitMV4x4 // -3 = type 3
+	} else if !d.fp.readBit(mbSplitProb[1]) {
+		splitType = splitMV8x8 // -2 = type 2
+	} else if !d.fp.readBit(mbSplitProb[2]) {
+		splitType = splitMV16x8 // -0 = type 0
+	} else {
+		splitType = splitMV8x16 // -1 = type 1
+	}
+
+	// Initialize sub-block MVs to zero.
+	for i := range d.subMV {
+		d.subMV[i] = mvZero
+	}
+
+	// Get left and above sub-block MVs for context.
+	// Left blocks are at indices 3, 7, 11, 15 of the previous MB.
+	// Above blocks are at indices 12, 13, 14, 15 of the above MB.
+	var leftMVs [4]motionVector  // Left edge sub-blocks (rows 0-3)
+	var aboveMVs [4]motionVector // Above edge sub-blocks (cols 0-3)
+
+	if mbx > 0 && d.leftRefFrame != refFrameIntra {
+		// Use the right edge of the left MB's sub-MVs.
+		// If left MB was not SPLITMV, use its mbMV for all.
+		leftMVs[0] = d.leftMV
+		leftMVs[1] = d.leftMV
+		leftMVs[2] = d.leftMV
+		leftMVs[3] = d.leftMV
+	}
+	if mby > 0 && d.aboveRefFrame != refFrameIntra {
+		// Use the bottom edge of the above MB's sub-MVs.
+		aboveMVs[0] = d.aboveMV
+		aboveMVs[1] = d.aboveMV
+		aboveMVs[2] = d.aboveMV
+		aboveMVs[3] = d.aboveMV
+	}
+
+	// Parse MVs for each partition.
+	numPartitions := mbSplitCount[splitType]
+	for p := 0; p < numPartitions; p++ {
+		// Determine the first block index in this partition.
+		firstBlock := mbSplitFillOffset[splitType][p][0]
+
+		// Get left and above MVs for this sub-block.
+		blockRow := firstBlock / 4
+		blockCol := firstBlock % 4
+
+		var leftMV, aboveMV motionVector
+		if blockCol == 0 {
+			// Left edge of MB - use left MB's MV.
+			leftMV = leftMVs[blockRow]
+		} else {
+			// Use MV from the block to the left within this MB.
+			leftMV = d.subMV[firstBlock-1]
+		}
+		if blockRow == 0 {
+			// Top edge of MB - use above MB's MV.
+			aboveMV = aboveMVs[blockCol]
+		} else {
+			// Use MV from the block above within this MB.
+			aboveMV = d.subMV[firstBlock-4]
+		}
+
+		// Determine the context for sub-MV mode.
+		ctx := d.getSubMVContext(leftMV, aboveMV)
+		prob := subMvRefProb[ctx]
+
+		// Parse sub-MV mode.
+		var subMV motionVector
+		if !d.fp.readBit(prob[0]) {
+			// LEFT - use left MV.
+			subMV = leftMV
+		} else if !d.fp.readBit(prob[1]) {
+			// ABOVE - use above MV.
+			subMV = aboveMV
+		} else if !d.fp.readBit(prob[2]) {
+			// ZERO - zero MV.
+			subMV = mvZero
+		} else {
+			// NEW - read new MV, add to nearest.
+			deltaMV := d.readMV()
+			subMV = addMV(nearest, deltaMV)
+		}
+
+		// Clamp the MV.
+		subMV = d.clampMV(subMV, mbx, mby)
+
+		// Fill all blocks in this partition with the same MV.
+		fillCount := mbSplitFillCount[splitType][p]
+		for i := 0; i < fillCount; i++ {
+			blockIdx := mbSplitFillOffset[splitType][p][i]
+			d.subMV[blockIdx] = subMV
+		}
+	}
+
+	// For neighbor prediction, use the MV of a representative block.
+	// Typically block 15 (bottom-right) or average.
+	d.mbMV = d.subMV[15]
+}
+
+// getSubMVContext returns the context for sub-MV mode based on left/above MVs.
+func (d *Decoder) getSubMVContext(left, above motionVector) int {
+	leftZero := left.x == 0 && left.y == 0
+	aboveZero := above.x == 0 && above.y == 0
+	same := left.x == above.x && left.y == above.y
+
+	if same {
+		return 4 // Same
+	}
+	if leftZero && aboveZero {
+		return 3 // Both zero
+	}
+	if aboveZero {
+		return 2 // Above zero
+	}
+	if leftZero {
+		return 1 // Left zero
+	}
+	return 0 // Normal
 }
 
 // findBestMV finds the nearest and near motion vectors from neighboring macroblocks.

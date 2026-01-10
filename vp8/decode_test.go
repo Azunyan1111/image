@@ -319,9 +319,8 @@ func TestDecode1080p30fps5s(t *testing.T) {
 // TestDecodeQRCodeVideo tests that the VP8 decoder produces frames with sufficient
 // quality to decode a QR code. This verifies the decoder meets minimum quality requirements.
 func TestDecodeCompareWithFFmpeg(t *testing.T) {
-	// Save failed frames for visual inspection.
-	const expectedQRContent = "VP8_DECODER_TEST_2025"
-	path := filepath.Join("testdata", "qrcode_best_quality.ivf")
+	// Decode testsrc video and save frames for visual comparison.
+	path := filepath.Join("testdata", "testsrc.ivf")
 	data, err := os.ReadFile(path)
 	if err != nil {
 		t.Skipf("test data not found: %v", err)
@@ -333,11 +332,14 @@ func TestDecodeCompareWithFFmpeg(t *testing.T) {
 		t.Fatalf("parseIVFHeader: %v", err)
 	}
 
-	d := NewDecoder()
-	qrReader := qrcode.NewQRCodeReader()
-	savedCount := 0
+	t.Logf("IVF: %dx%d, %d frames", h.Width, h.Height, h.NumFrames)
 
-	for i := uint32(0); i < h.NumFrames && savedCount < 3; i++ {
+	d := NewDecoder()
+
+	// Decode and save frames 0, 1, 10, 20.
+	framesToSave := map[uint32]bool{0: true, 1: true, 10: true, 20: true}
+
+	for i := uint32(0); i < h.NumFrames; i++ {
 		frameData, _, err := readIVFFrame(r)
 		if err != nil {
 			break
@@ -354,14 +356,8 @@ func TestDecodeCompareWithFFmpeg(t *testing.T) {
 			t.Fatalf("frame %d: DecodeFrame: %v", i, err)
 		}
 
-		// Try to read QR code.
-		grayImg := ycbcrToGray(img)
-		bmp, _ := gozxing.NewBinaryBitmapFromImage(grayImg)
-		result, qrErr := qrReader.Decode(bmp, nil)
-
-		if qrErr != nil || result.GetText() != expectedQRContent {
-			// Save failed frame.
-			outPath := fmt.Sprintf("/tmp/vp8_failed_%d_key%v.png", i, fh.KeyFrame)
+		if framesToSave[i] {
+			outPath := fmt.Sprintf("/tmp/vp8_testsrc_%02d_key%v.png", i, fh.KeyFrame)
 			f, _ := os.Create(outPath)
 			bounds := img.Bounds()
 			rgba := image.NewRGBA(bounds)
@@ -372,10 +368,12 @@ func TestDecodeCompareWithFFmpeg(t *testing.T) {
 			}
 			png.Encode(f, rgba)
 			f.Close()
-			t.Logf("Frame %d (keyframe=%v) FAILED - saved to %s", i, fh.KeyFrame, outPath)
-			savedCount++
-		} else {
-			t.Logf("Frame %d (keyframe=%v) OK", i, fh.KeyFrame)
+			t.Logf("Saved frame %d (keyframe=%v) to %s", i, fh.KeyFrame, outPath)
+			if !fh.KeyFrame {
+				t.Logf("Frame %d MV modes: NEAREST=%d, NEAR=%d, ZERO=%d, NEW=%d, SPLIT=%d | Intra=%d, Inter=%d",
+					i, d.MVModeCount[0], d.MVModeCount[1], d.MVModeCount[2], d.MVModeCount[3], d.MVModeCount[4],
+					d.IntraMBCount, d.InterMBCount)
+			}
 		}
 	}
 }

@@ -474,7 +474,9 @@ func (d *Decoder) reconstruct(mbx, mby int) (skip bool) {
 
 		if isInter {
 			// Inter prediction.
-			d.usePredY16 = true // Inter mode uses 16x16 for residuals.
+			// RFC 6386: Inter-predicted macroblocks do NOT use Y2 (WHT).
+			// They use 16 individual 4x4 DCT blocks directly.
+			d.usePredY16 = false
 
 			// Parse residuals.
 			if !skip {

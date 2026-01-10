@@ -181,6 +181,12 @@ type Decoder struct {
 	aboveRefFrame uint8
 	upRefFrame    []uint8 // Reference frames of macroblocks above.
 	upMV          []motionVector // Motion vectors of macroblocks above (reusing the name would conflict).
+
+	// Debug counters for MV modes.
+	MVModeCount [6]int
+	// Debug counters for MB types.
+	IntraMBCount int
+	InterMBCount int
 }
 
 // NewDecoder returns a new Decoder.
@@ -485,6 +491,11 @@ func (d *Decoder) updateFrameBuffers() {
 			d.lastFrame = d.copyFrame(d.img)
 		}
 	}
+}
+
+// GetLastFrame returns the last frame for debugging.
+func (d *Decoder) GetLastFrame() *image.YCbCr {
+	return d.lastFrame
 }
 
 // getRefFrame returns the reference frame for the given reference type.
